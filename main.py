@@ -1,8 +1,7 @@
-from src.llm import LLM
+from src.pre_experiment.verify_entropy import verify_entropy
 
-llm = LLM()
-res = llm.invoke_entropy("你好")
-print(res)
 
+if __name__ == "__main__":
+    verify_entropy()
 
 
