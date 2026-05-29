@@ -41,75 +41,87 @@ os.makedirs(RESULTS_DIR, exist_ok=True)
 
 # ==================== 分块编码与缓存 =======================
 
-def encode_chunked(texts, tokenizer, encoder):
-    """
-    对一批文本进行分块编码：
-    1. Tokenize 全文（不截断）
-    2. 按 CHUNK_SIZE + STRIDE 滑窗切分
-    3. 每块独立过 ModernBERT 提取 CLS 向量
-    4. Max Pooling 聚合为单个 768 维向量
-    """
-    all_embeddings = []
+def encode_single(text, tokenizer, encoder):
+    """编码单条文本（短文本直接编码，长文本分块 Max Pooling）。"""
+    tokens = tokenizer.encode(text, add_special_tokens=True)
+    total_len = len(tokens)
 
-    for text in tqdm(texts, desc="Chunked encoding"):
-        # Tokenize 全文，不截断
-        tokens = tokenizer.encode(text, add_special_tokens=True)
-        total_len = len(tokens)
-
-        if total_len <= CHUNK_SIZE:
-            # 短文本：直接编码
-            inputs = tokenizer(
-                text, max_length=CHUNK_SIZE, truncation=True,
-                padding="max_length", return_tensors="pt",
-            ).to(DEVICE)
+    if total_len <= CHUNK_SIZE:
+        inputs = tokenizer(
+            text, max_length=CHUNK_SIZE, truncation=True,
+            padding="max_length", return_tensors="pt",
+        ).to(DEVICE)
+        with torch.no_grad():
+            vec = encoder(**inputs).last_hidden_state[:, 0, :]
+        return vec.cpu().squeeze(0)
+    else:
+        chunk_vecs = []
+        for start in range(0, total_len, STRIDE):
+            chunk_tokens = tokens[start : start + CHUNK_SIZE]
+            if len(chunk_tokens) < 64:
+                break
+            input_ids = torch.tensor([chunk_tokens], dtype=torch.long).to(DEVICE)
+            attention_mask = torch.ones_like(input_ids)
             with torch.no_grad():
-                vec = encoder(**inputs).last_hidden_state[:, 0, :]
-            all_embeddings.append(vec.cpu())
+                vec = encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state[:, 0, :]
+            chunk_vecs.append(vec.cpu())
+
+        if chunk_vecs:
+            return torch.cat(chunk_vecs, dim=0).max(dim=0).values
         else:
-            # 长文本：滑窗分块
-            chunk_vecs = []
-            for start in range(0, total_len, STRIDE):
-                chunk_tokens = tokens[start : start + CHUNK_SIZE]
-                if len(chunk_tokens) < 64:
-                    break  # 丢弃过短的尾部块
-                # 手动构造 input
-                input_ids = torch.tensor([chunk_tokens], dtype=torch.long).to(DEVICE)
-                attention_mask = torch.ones_like(input_ids)
-                with torch.no_grad():
-                    vec = encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state[:, 0, :]
-                chunk_vecs.append(vec)
-
-            if chunk_vecs:
-                # Max Pooling: (num_chunks, 768) -> (768,)
-                stacked = torch.cat(chunk_vecs, dim=0)   # (num_chunks, 768)
-                pooled = stacked.max(dim=0).values        # (768,)
-            else:
-                pooled = torch.zeros(768)
-            all_embeddings.append(pooled.unsqueeze(0))
-
-    return torch.cat(all_embeddings, dim=0)
+            return torch.zeros(768)
 
 
 def extract_embeddings(split, cache_path):
-    """提取嵌入（带缓存），split='train' 或 'test'。"""
-    if os.path.exists(cache_path):
+    """提取嵌入，支持断点续跑：每 1000 条自动保存，崩溃后从上次位置继续。"""
+    labels_t = None
+
+    # 检查是否有未完成的断点缓存
+    checkpoint_path = cache_path + ".partial"
+    start_idx = 0
+
+    if os.path.exists(checkpoint_path):
+        print(f"[断点续跑] 发现 {checkpoint_path}，继续...")
+        ckpt = torch.load(checkpoint_path, weights_only=True)
+        all_embeddings = [ckpt["embeddings"]]
+        start_idx = ckpt["next_idx"]
+        labels_t = ckpt["labels"]
+        print(f"  已有 {start_idx} 条，从第 {start_idx + 1} 条继续")
+    elif os.path.exists(cache_path):
         print(f"[缓存] 发现 {cache_path}，直接加载...")
         cache = torch.load(cache_path, weights_only=True)
         return cache["embeddings"], cache["labels"]
+    else:
+        all_embeddings = []
+        start_idx = 0
 
-    print(f"[编码] 加载 {split} 集并分块编码...")
+    print(f"[编码] 加载 {split} 集...")
     ds = load_from_disk(DATASET_DIR)[split]
     texts = list(ds["content"])
-    labels = [LABEL_MAP[l] for l in ds["label"]]
+
+    if labels_t is None:
+        labels = [LABEL_MAP[l] for l in ds["label"]]
+        labels_t = torch.tensor(labels)
 
     tokenizer = AutoTokenizer.from_pretrained(ENCODER_NAME)
     encoder = AutoModel.from_pretrained(ENCODER_NAME).to(DEVICE)
     encoder.eval()
 
-    embeddings = encode_chunked(texts, tokenizer, encoder)
-    labels_t = torch.tensor(labels)
+    for i in tqdm(range(start_idx, len(texts)), desc="Chunked encoding", initial=start_idx, total=len(texts)):
+        vec = encode_single(texts[i], tokenizer, encoder)
+        all_embeddings.append(vec.unsqueeze(0))
 
+        # 每 1000 条保存断点
+        if (i + 1) % 1000 == 0:
+            emb_so_far = torch.cat(all_embeddings, dim=0)
+            torch.save({"embeddings": emb_so_far, "labels": labels_t, "next_idx": i + 1}, checkpoint_path)
+            print(f"  [断点] 已保存 {i + 1}/{len(texts)}")
+
+    # 编码完成，合并并保存最终缓存
+    embeddings = torch.cat(all_embeddings, dim=0)
     torch.save({"embeddings": embeddings, "labels": labels_t}, cache_path)
+    if os.path.exists(checkpoint_path):
+        os.remove(checkpoint_path)
     print(f"[缓存] 已保存至 {cache_path}")
     print(f"  维度: {embeddings.shape}")
 

@@ -14,6 +14,8 @@ from tqdm import tqdm
 import json
 import numpy as np
 
+from src.pre_experiment.verify_classifier import extract_embeddings
+
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 RESULTS_DIR = os.path.join(PROJECT_ROOT, "results", "classifier")
 CKPT_PATH = os.path.join(RESULTS_DIR, "checkpoints", "classifier.pt")
@@ -44,10 +46,8 @@ class MLPClassifier(nn.Module):
 def evaluate():
     print(f"[设备] {DEVICE}")
 
-    print(f"[缓存] 加载 {CACHE_TEST}...")
-    cache = torch.load(CACHE_TEST, weights_only=True)
-    embeddings = cache["embeddings"]
-    labels = cache["labels"]
+    print(f"[缓存] 加载测试集嵌入...")
+    embeddings, labels = extract_embeddings("test", CACHE_TEST)
     print(f"  维度: {embeddings.shape}, Normal: {sum(labels==0).item()}, Injected: {sum(labels==1).item()}")
 
     model = MLPClassifier().to(DEVICE)
