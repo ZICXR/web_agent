@@ -7,6 +7,8 @@ def compute_entropy(probs):
 def calculate_entropy(response):
     results = []
     tokens = response.choices[0].logprobs.content
+    if tokens is None:
+        return {"content": "", "results": []}
     content = ""
     # token 是选择的最大的  top_logprobs 是全部的
     for token_info in tokens:  # 遍历所有token的可能取值
